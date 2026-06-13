@@ -2,6 +2,8 @@
 
 OpenAI-compatible proxy for [UMANS AI](https://code.umans.ai). Zero external dependencies.
 
+<img width="990" height="739" alt="image" src="https://github.com/user-attachments/assets/14b73221-240a-41f9-b785-6ef7758bdaa3" />
+
 ## Features
 
 - **OpenAI-Compatible API** — Drop-in for `/v1/chat/completions` and `/v1/models`
