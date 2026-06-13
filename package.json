@@ -1,0 +1,22 @@
+{
+  "name": "umans-proxy",
+  "version": "1.0.0",
+  "description": "OpenAI-compatible proxy server for UMANS AI",
+  "main": "proxy.js",
+  "scripts": {
+    "start": "node proxy.js",
+    "dev": "node --watch proxy.js",
+    "start:bun": "bun run proxy.js"
+  },
+  "keywords": [
+    "umans-proxy",
+    "umans",
+    "proxy",
+    "openai",
+    "llm",
+    "api"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {}
+}

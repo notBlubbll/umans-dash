@@ -1,0 +1,145 @@
+# UMANS-Proxy
+
+OpenAI-compatible proxy for [UMANS AI](https://code.umans.ai). Zero external dependencies.
+
+## Features
+
+- **OpenAI-Compatible API** — Drop-in for `/v1/chat/completions` and `/v1/models`
+- **Single Account** — One UMANS account with app login for usage tracking
+- **90-Day Usage History** — View daily token usage for the last 90 days
+- **Model Search & Add** — Search the UMANS model catalog from the dashboard and add models with one click
+- **Response Caching** — LRU cache for non-streaming responses
+- **Dashboard** — Clean UI with usage cards, model management, and configuration
+- **AI-Translated Dashboard (i18n)** — One-click autotranslate for the dashboard UI. Powered by `umans-flash` and cached locally.
+- **Bing Wallpaper** — Daily rotating backgrounds from Bing
+
+## Quick Start
+
+### Prerequisites
+
+- Node.js 18+ or Bun
+
+### 1. Get a UMANS API Key
+
+1. Go to **[app.umans.ai](https://app.umans.ai)** and sign up or log in.
+2. Navigate to **API Keys** section.
+3. Click **Create API Key** — you'll get a key starting with `sk-...`.
+4. Copy this key — it will be used by the proxy.
+
+### 2. Configure the Proxy
+
+Edit `.config/config.json` and set your API key:
+
+```json
+{
+  "API_KEY": "sk-your-umans-api-key-here",
+  "EMAIL": "your@email.com",
+  "PASSWORD": "your-password"
+}
+```
+
+Or via environment variable:
+
+```cmd
+set UMANS_API_KEY=sk-your-umans-api-key-here
+```
+
+### 3. Start the Proxy
+
+```bash
+node proxy.js
+```
+
+Or on Windows, double-click `start.cmd`.
+
+### 4. Add Models
+
+Open the dashboard at **http://localhost:8084** and use the model search to browse and add models.
+
+### 5. Use with Any OpenAI Client
+
+```javascript
+import OpenAI from 'openai';
+
+const client = new OpenAI({
+  apiKey: 'sk-your-umans-api-key',
+  baseURL: 'http://localhost:8084/v1'
+});
+
+const response = await client.chat.completions.create({
+  model: 'qwen3-coder', // must be in your enabled models list
+  messages: [{ role: 'user', content: 'Hello!' }]
+});
+```
+
+## Dashboard
+
+Open **http://localhost:8084** in your browser.
+
+### Usage Cards
+- **Total Tokens** — Current token usage with progress bar
+- **90-Day History** — Daily token usage breakdown for the last 90 days
+- **Account Status** — UMANS app login status
+
+### Model Management
+- **Model Search** — Search the UMANS catalog by name or family
+- **Enable/Disable Models** — Toggle models on/off with one click
+
+### Quick Actions
+- Health check, connection test, usage refresh, save configuration
+
+### Autotranslate
+The dashboard can translate itself via the `umans-flash` model. Toggle the **autotranslate (beta)** switch in the bottom-left corner. If `LOCALE` is set in `.config/config.json`, that locale is forced and the dashboard loads translated automatically. The first load for a locale may take a few seconds while the proxy generates and caches the translation in `.cache/i18n/{locale}.json`. If no API key is configured, the dashboard stays in English.
+
+## API Endpoints
+
+| Method | Path | Description |
+|---|---|---|
+| `GET` | `/healthz` | Proxy health check |
+| `GET` | `/v1/models` | OpenAI-format model list |
+| `POST` | `/v1/chat/completions` | OpenAI-format chat completions |
+| `GET` | `/api/config` | Get proxy configuration |
+| `POST` | `/api/config` | Update proxy configuration |
+| `GET` | `/api/validate` | Validate API key |
+| `GET` | `/api/models` | List enabled models |
+| `GET` | `/api/models/search?q=...` | Search UMANS model catalog |
+| `POST` | `/api/models/add` | Add models to enabled list |
+| `POST` | `/api/models/remove` | Remove models from enabled list |
+| `GET` | `/api/umans/usage` | UMANS usage data |
+| `GET` | `/api/umans/usage-history` | 90-day usage history |
+| `GET` | `/api/umans/concurrency` | Concurrency sessions, limit, active count & queue depth |
+| `POST` | `/api/umans/login` | Login to UMANS app |
+| `GET` | `/api/umans/user` | UMANS login status |
+| `POST` | `/api/umans/logout` | Logout from UMANS app |
+| `GET` | `/api/keys` | List API keys |
+| `POST` | `/api/keys` | Add/update/delete API keys |
+| `GET` | `/api/cache` | Cache stats |
+| `DELETE` | `/api/cache` | Clear cache |
+| `GET` | `/api/bg` | Daily Bing wallpaper |
+| `GET` | `/api/i18n` | Translation bundle for the dashboard (cached; use `?generate=1` to force) |
+| `GET` | `/api/i18n?config=1` | i18n configuration: key status and forced/fallback locale |
+
+## Configuration
+
+`.config/config.json` supports:
+
+| Field | Description | Default |
+|---|---|---|
+| `LISTEN_ADDR` | Proxy listen address | `127.0.0.1:8084` |
+| `UPSTREAM_BASE_URL` | UMANS API URL | `https://api.code.umans.ai/v1` |
+| `API_KEY` | UMANS API key (`sk-*`) | — |
+| `EMAIL` | UMANS app email for usage tracking | — |
+| `PASSWORD` | UMANS app password | — |
+| `REQUEST_TIMEOUT` | Upstream request timeout | `15m` |
+| `CACHE_TTL` | Response cache TTL | `60s` |
+| `CACHE_MAX_SIZE` | Max cached responses | `100` |
+| `CACHE_ENABLED` | Enable/disable cache | `true` |
+| `ENABLED_MODELS` | Array of model IDs to expose | `[]` |
+| `MODEL_DISPLAY_NAMES` | Custom display names per model | `{}` |
+| `API_KEYS` | Array of allowed proxy API keys (auth) | `[]` |
+| `OVERRIDE_CONCURRENCY` | Override concurrent sessions value (0 = auto-detect from API) | `0` |
+| `LOCALE` | Force dashboard locale (e.g. `de`); falls back to English when no API key | — |
+
+## License
+
+MIT
