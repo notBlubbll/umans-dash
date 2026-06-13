@@ -11,6 +11,7 @@ OpenAI-compatible proxy for [UMANS AI](https://code.umans.ai). Zero external dep
 - **90-Day Usage History** — View daily token usage for the last 90 days
 - **Model Search & Add** — Search the UMANS model catalog from the dashboard and add models with one click
 - **Response Caching** — LRU cache for non-streaming responses
+- **Automatic Upstream Retry** — Retries failed `/v1/chat/completions` on HTTP 500/503 and network failures up to 10 times with escalating backoff, rotating the API key pool on each attempt
 - **Dashboard** — Clean UI with usage cards, model management, and configuration
 - **AI-Translated Dashboard (i18n)** — One-click autotranslate for the dashboard UI. Powered by `umans-flash` and cached locally.
 - **Bing Wallpaper** — Daily rotating backgrounds from Bing

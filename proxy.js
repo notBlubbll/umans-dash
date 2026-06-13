@@ -73,6 +73,20 @@ let freegenLastError = null;
 const RATE_LIMIT_MAP = {};
 const rateLimitTimestamps = new Map();
 
+const MAX_RETRIES = 10;
+const RETRY_DELAY_MS = 3000;
+
+async function retryLoop(fn) {
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    const result = await fn({ attempt, isLast: attempt === MAX_RETRIES });
+    if (!result.retry) return result;
+    if (attempt < MAX_RETRIES) {
+      const delay = RETRY_DELAY_MS + (3000 * (attempt - 1));
+      await new Promise(r => setTimeout(r, delay));
+    }
+  }
+}
+
 async function enforceRateLimit(model) {
   const delay = RATE_LIMIT_MAP[model];
   if (!delay) return;
@@ -1806,78 +1820,101 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
   payload.thinking = { type: 'enabled' };
 
   await enforceRateLimit(requestedModel);
-  let resp;
-  try {
-    resp = await upstream.chatCompletions(payload);
-  } catch (e) {
-    keyPool.markUnhealthy(slot.index, 502);
-    writeError(res, 502, e.message, 'server_error', '');
-    return;
-  }
 
-  const contentType = resp.headers['content-type'] || '';
-  console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-upstream:${resp.status} ct:${contentType}`);
-
-  if (resp.status >= 200 && resp.status < 300) {
+  await retryLoop(async ({ attempt, isLast }) => {
+    let resp;
     try {
-      if (contentType.includes('text/event-stream')) {
-        let headersSent = false;
-        const onData = (chunk) => {
-          if (!headersSent) {
-            res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-            headersSent = true;
-          }
-          res.write(Buffer.from(chunk));
-        };
-        const onEnd = () => { if (!headersSent) { res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' }); headersSent = true; } try { res.end(); } catch {} };
-        const onError = () => { if (!headersSent) { res.writeHead(502); } try { res.end(); } catch {} };
-        if (resp.body && typeof resp.body.pipe === 'function') {
-          await new Promise((resolve) => {
-            resp.body.on('data', chunk => onData(chunk));
-            resp.body.on('end', () => { onEnd(); resolve(); });
-            resp.body.on('error', () => { onError(); resolve(); });
-          });
-        } else if (resp.body && typeof resp.body.getReader === 'function') {
-          const reader = resp.body.getReader();
-          try {
-            while (true) {
-              const { done, value } = await reader.read();
-              if (done) { onEnd(); break; }
-              onData(value);
-            }
-          } catch { onError(); }
-        }
-      } else {
-        let bodyText = await readBodyText(resp.body);
-        const skipHeaders = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'content-encoding']);
-        if (requestedStream) skipHeaders.add('content-type');
-        for (const [key, values] of Object.entries(resp.headers)) {
-          if (skipHeaders.has(key.toLowerCase())) continue;
-          res.setHeader(key, values);
-        }
-        if (requestedStream) {
-          let parsed = null;
-          try { parsed = JSON.parse(bodyText); } catch (e) { /* ignore */ }
-          res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-          res.end(parsed ? bodyText : `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: bodyText }, finish_reason: 'stop' }] })}\n\n`);
-        } else {
-          res.writeHead(resp.status);
-          res.end(bodyText);
-        }
-        if (ck) responseCache.set(ck, bodyText);
-        console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-body:${bodyText.substring(0, 800)}`);
+      resp = await upstream.chatCompletions(payload);
+    } catch (e) {
+      keyPool.markUnhealthy(slot.index, 502);
+      if (isLast) {
+        writeError(res, 502, e.message, 'server_error', '');
+        return { retry: false };
       }
-    } catch (e) { console.error(`proxy response copy failed: ${e.message}`); }
-    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-done:${Date.now() - reqStart}ms`);
-    return;
-  }
+      const delay = RETRY_DELAY_MS + (3000 * (attempt - 1));
+      console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-network-retry:${attempt}/${MAX_RETRIES}-waiting:${delay}ms (${e.message})`);
+      return { retry: true };
+    }
 
-  const errorBodyStr = await readBodyText(resp.body);
-  if (resp.status >= 500) keyPool.markUnhealthy(slot.index, resp.status);
-  console.error(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-error:${resp.status}`);
-  writeUpstreamError(res, resp.status, errorBodyStr);
+    const contentType = resp.headers['content-type'] || '';
+    console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-upstream:${resp.status} ct:${contentType}`);
+
+    if (resp.status >= 200 && resp.status < 300) {
+      try {
+        if (contentType.includes('text/event-stream')) {
+          let headersSent = false;
+          const onData = (chunk) => {
+            if (!headersSent) {
+              res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+              headersSent = true;
+            }
+            res.write(Buffer.from(chunk));
+          };
+          const onEnd = () => { if (!headersSent) { res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' }); headersSent = true; } try { res.end(); } catch {} };
+          const onError = () => { if (!headersSent) { res.writeHead(502); } try { res.end(); } catch {} };
+          if (resp.body && typeof resp.body.pipe === 'function') {
+            await new Promise((resolve) => {
+              resp.body.on('data', chunk => onData(chunk));
+              resp.body.on('end', () => { onEnd(); resolve(); });
+              resp.body.on('error', () => { onError(); resolve(); });
+            });
+          } else if (resp.body && typeof resp.body.getReader === 'function') {
+            const reader = resp.body.getReader();
+            try {
+              while (true) {
+                const { done, value } = await reader.read();
+                if (done) { onEnd(); break; }
+                onData(value);
+              }
+            } catch { onError(); }
+          }
+        } else {
+          let bodyText = await readBodyText(resp.body);
+          const skipHeaders = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'content-encoding']);
+          if (requestedStream) skipHeaders.add('content-type');
+          for (const [key, values] of Object.entries(resp.headers)) {
+            if (skipHeaders.has(key.toLowerCase())) continue;
+            res.setHeader(key, values);
+          }
+          if (requestedStream) {
+            let parsed = null;
+            try { parsed = JSON.parse(bodyText); } catch (e) { /* ignore */ }
+            res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+            res.end(parsed ? bodyText : `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: bodyText }, finish_reason: 'stop' }] })}
+
+`);
+          } else {
+            res.writeHead(resp.status);
+            res.end(bodyText);
+          }
+          if (ck) responseCache.set(ck, bodyText);
+          console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-body:${bodyText.substring(0, 800)}`);
+        }
+      } catch (e) { console.error(`proxy response copy failed: ${e.message}`); }
+      console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-done:${Date.now() - reqStart}ms`);
+      return { retry: false };
+    }
+
+    const errorBodyStr = await readBodyText(resp.body);
+
+    if (resp.status === 500 || resp.status === 503) {
+      keyPool.markUnhealthy(slot.index, resp.status);
+      if (isLast) {
+        console.error(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-error:${resp.status}-FINAL`);
+        writeUpstreamError(res, resp.status, errorBodyStr);
+        return { retry: false };
+      }
+      const delay = RETRY_DELAY_MS + (3000 * (attempt - 1));
+      console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-retry:${attempt}/${MAX_RETRIES}-waiting:${delay}ms`);
+      return { retry: true };
+    }
+
+    if (resp.status >= 500) keyPool.markUnhealthy(slot.index, resp.status);
+    console.error(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-error:${resp.status}`);
+    writeUpstreamError(res, resp.status, errorBodyStr);
+    return { retry: false };
+  });
 }
-
 function writePassthroughError(res, statusCode, body) {
   const trimmed = body.trim();
   try { const payload = JSON.parse(trimmed); writeOpenAIError(res, statusCode, payload.error?.message || payload.message || trimmed, payload.error?.type || 'upstream_error', payload.error?.code || ''); }

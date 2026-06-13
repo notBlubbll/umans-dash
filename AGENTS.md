@@ -53,8 +53,22 @@ UMANS-PROXY/
 | `MODEL_CATALOG_CACHE_TTL` | 300000 (5min) | Catalog fetch cache TTL |
 | `RATE_LIMIT_MAP` | Object | Per-model rate limit delays |
 | `MAX_BODY_SIZE` | Number | Hard request body cap (5 MB) |
+| `MAX_RETRIES` | Number | Upstream chat-completion retries (10) |
+| `RETRY_DELAY_MS` | Number | Base retry backoff (3000 ms) |
 
-### 3. Response Cache (proxy.js:51-97)
+### 3. Retry Logic (proxy.js:79-88, 1822-1916)
+
+`retryLoop(fn)` retries the upstream `/v1/chat/completions` request up to `MAX_RETRIES` times with escalating delays (`3s, 6s, 9s…`).
+
+- Retries occur on:
+  - **HTTP 500** — regardless of response body / message
+  - **HTTP 503** — regardless of response body / message
+  - Network/fetch failures (treated as 502) that throw before a response is received
+- On each retry the current key is marked unhealthy so the key pool rotates to the next healthy key.
+- Non-retryable HTTP errors (e.g. 400, 401, 404, 429 without a configured rate-limit map) are returned immediately.
+
+
+### 4. Response Cache (proxy.js:99-142)
 
 LRU cache for non-streaming LLM responses using Map insertion order.
 - **Key**: MD5 of `(model + stream_flag + system + messages + tools)`
@@ -63,7 +77,7 @@ LRU cache for non-streaming LLM responses using Map insertion order.
 - `cacheKey(payload, model)` — builds MD5 hash
 - `GET/DELETE /api/cache` — stats/clear
 
-### 4. Key Pool (proxy.js:321-396)
+### 5. Key Pool (proxy.js:321-396)
 
 Round-robin multi-key pool with cooldown/unhealthy marking.
 - `acquire()` — Round-robins, returns `{ key, name, index }`, sets `config.apiKey` + `upstream.apiKey`
@@ -71,7 +85,7 @@ Round-robin multi-key pool with cooldown/unhealthy marking.
 - `markHealthy(index)` — Resets state
 - `get state()` — Returns array with masked tokens (first 10 + `...` + last 4)
 
-### 5. Upstream Client & Model Catalog (proxy.js:421-541)
+### 6. Upstream Client & Model Catalog (proxy.js:421-541)
 
 - `UpstreamClient` class with `getUserInfo()` (GET `/v1/models/info`, 10s timeout) and `chatCompletions(body)` (POST `/v1/chat/completions`)
 - `UPSTREAM_AGENT` — Keep-alive HTTPS agent (128 sockets, 60s keepalive)
@@ -79,33 +93,33 @@ Round-robin multi-key pool with cooldown/unhealthy marking.
 - `getCatalogData()` — Cached 5-min catalog fetcher, populates `modelDisplayNameMap`
 - `searchModels(query, filters)` — Local filter of catalog data (substring + family)
 
-### 6. Tool Schema Normalization (proxy.js:543-652)
+### 7. Tool Schema Normalization (proxy.js:543-652)
 
 Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullable patterns.
 - Key functions: `normalizeToolSchemas`, `normalizeSchemaMap`, `tryResolveRef`, `simplifyNullableCombinator`, `normalizeTypeField`, `normalizeEnumField`
 
-### 7. Stream/Body Utilities (proxy.js:654-728)
+### 8. Stream/Body Utilities (proxy.js:654-728)
 
 - `isNodeStream(body)` — Duck-type check for Node.js streams
 - `readBodyText(body)` — Handles Node streams, Web ReadableStreams, and async iterables
 - `pipeBodyToResponse(res, body)` — Pipes upstream response to HTTP response with abort handling
 
-### 8. HTTP Handler Helpers (proxy.js:730-759)
+### 9. HTTP Handler Helpers (proxy.js:730-759)
 
 - `authorized(req)` — Checks `x-api-key` or `Authorization: Bearer` against `config.apiKeys`
 - `readBody(req)` — Promisified chunk collector with `MAX_BODY_SIZE` cap
 - `writeJSON(res, status, payload)` / `writeOpenAIError(res, status, message, type, code)`
 
-### 9. Core HTTP Handlers (proxy.js:761-942)
+### 10. Core HTTP Handlers (proxy.js:761-942)
 
 - `handleHealthz` — Returns uptime, token_state, models_count, runtime, cache stats
 - `handleModels` — OpenAI-format model list from `config.enabledModels`
 - `processQueue()` — Dequeues from `requestQueue` while `activeRequests < limit`
 - `handleChatCompletions` — Parses body, queues or executes via `proxyChatRequest`
-- `proxyChatRequest` — Full proxy pipeline: key acquire → session label → reasoning strip → image-attachment limit (`limitImagesInMessages`) → cache check → model resolve → tool normalize → rate limit → upstream call → title-output sanitize (for title prompts) → stream/non-stream response. The full request body of the first request in a new session is logged to the console.
+- `proxyChatRequest` — Full proxy pipeline: key acquire → session label → reasoning strip → image-attachment limit (`limitImagesInMessages`) → cache check → model resolve → tool normalize → rate limit → **retry-wrapped upstream call** (see Retry Logic) → title-output sanitize (for title prompts) → stream/non-stream response. The full request body of the first request in a new session is logged to the console.
 - `validateApiKey()` — Calls `getUserInfo()`, populates `userInfoCache` + `modelDisplayNameMap`, returns boolean
 
-### 10. Request Router (proxy.js:963-1341)
+### 11. Request Router (proxy.js:963-1341)
 
 | Route | Methods | Description |
 |---|---|---|
@@ -133,12 +147,12 @@ Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullab
 | `/v1/models` | GET | OpenAI-format models |
 | `/v1/chat/completions` | POST | OpenAI chat (concurrency-queued) |
 
-### 11. Opencode Config Discovery & Setup (proxy.js:1343-1412)
+### 12. Opencode Config Discovery & Setup (proxy.js:1343-1412)
 
 - `discoverOpencodeConfigs()` — Native filesystem discovery on Windows: scans `C:\Users` for directories and checks each for `.opencode/opencode.json` and `.config/opencode/opencode.json`, plus the `systemprofile` variant. Falls back to `~/.config/opencode/` and `~/.opencode/`. Non-Windows: returns existing parent dirs of the two fallback paths.
 - `setupOpencodeConfig()` — Writes ALL models from `modelDisplayNameMap` to every discovered `opencode.json`. Falls back to `config.enabledModels` if map is empty. Creates `openconfig.b4umans.json` backup before first edit. Provider key: `umans`, uses `@ai-sdk/openai-compatible`. Each model gets `id`, `name`, `reasoning: true`, `interleaved: true`.
 
-### 12. Usage Tracking & App Auth (proxy.js:201-319)
+### 13. Usage Tracking & App Auth (proxy.js:201-319)
 
 - `fetchUsage()` — GET `https://app.umans.ai/api/usage?context=personal` (app session cookie, 10s timeout, 5min cache)
 - `fetchUsageHistory()` — GET `https://app.umans.ai/api/usage/history?from=...&to=...&granularity=day` (15s timeout, 5min cache)
@@ -146,7 +160,7 @@ Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullab
 - `getEffectiveConcurrency()` — Returns `{ concurrent, limit, overridden }`. If `config.overrideConcurrency > 0`, the effective concurrency limit is capped to `min(override, apiLimit)` (or override when the API limit is unknown).
 - `loginToApp()` — CSRF → POST credentials → extracts `__Secure-authjs.session-token` from set-cookie. Saves to config.
 
-### 13. Dashboard (dashboard.html)
+### 14. Dashboard (dashboard.html)
 
 - **Stat Cards** — Requests, Tokens, Cached % (grouped under a “Window” glass card)
 - **Usage History** — 90-day paginated table (10 per page)
@@ -161,7 +175,7 @@ Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullab
 - **Glass UI** — Procedural SVG filter-based glassmorphism (`feDisplacementMap`, `feColorMatrix`)
 - **Auto-refresh** — Status every 15s, usage every 30s
 
-### 14. Dashboard ↔ UMANS API Data Flow
+### 15. Dashboard ↔ UMANS API Data Flow
 
 The dashboard does not talk to UMANS directly. All UMANS data passes through the proxy endpoints below, which cache responses for 5 minutes and forward the raw UMANS payload.
 
@@ -308,3 +322,27 @@ Zero external npm dependencies — uses only Node.js built-in modules: `fs`, `pa
 - `requestQueue` — FIFO array of pending requests
 - `processQueue()` — Dequeues when `activeRequests < limit`
 - Each completed request calls `processQueue()` via `.finally()`
+
+## Notes for Opencode Agents
+
+When working on UMANS-Proxy through opencode, keep the following in mind to avoid common tool failures.
+
+### Edit tool / exact replacements
+
+Opencode's `edit` tool requires an exact text match for `oldString`. If the error `Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.` appears, follow these steps:
+
+1. **Read the file first** with the `read` tool and copy the exact block you want to replace, including all spaces, tabs, and line endings.
+2. **Paste that verbatim** into the `edit` call's `oldString` parameter.
+3. **Include more surrounding lines** if the same string appears multiple times in the file (or use `replaceAll: true` only when you intend to replace every occurrence).
+4. If matching remains difficult, use the `write` tool to overwrite the entire file instead.
+
+### Web research
+
+- Use `webfetch` to retrieve content from a known URL.
+- Do **not** call `websearch`; it is not available unless the OpenCode provider or `OPENCODE_ENABLE_EXA` is enabled. Prefer `webfetch` for documentation or GitHub source lookups.
+
+### Provider configuration
+
+- The proxy auto-writes a `umans` provider into every discovered `opencode.json`.
+- The generated config explicitly sets `"instructions": ["AGENTS.md", "skills.md"]` so this guide and the provider reference are loaded on startup.
+- After the proxy updates `opencode.json`, restart opencode for the changes to take effect.
