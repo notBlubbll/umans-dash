@@ -142,7 +142,7 @@
 
   <label class="autotranslate-toggle" id="autotranslateToggle">
     <input type="checkbox" id="autotranslateCheckbox">
-    <span data-i18n="autotranslate_label">autotranslate (beta)</span>
+    <span data-i18n="autotranslate_label">AUTOTRANSLATION</span>
   </label>
 
   <svg style="position:absolute;overflow:hidden;width:0;height:0" color-interpolation-filters="sRGB">
@@ -292,17 +292,17 @@
                   <button class="btn btn-outline-action btn-wp" data-wp="none" onclick="setWallpaper('none')" data-i18n="wp_none">None</button>
                   <button class="btn btn-outline-action btn-wp" data-wp="bing" onclick="setWallpaper('bing')" data-i18n="wp_bing">Bing</button>
                   <button class="btn btn-outline-action btn-wp" data-wp="wallhaven" onclick="setWallpaper('wallhaven')" data-i18n="wp_wallhaven">Wallhaven</button>
-                  <button class="btn btn-outline-action btn-wp" data-wp="freegen" onclick="setWallpaper('freegen')" data-i18n="wp_freegen">FreeGen</button>
+                   <button class="btn btn-outline-action btn-wp" data-wp="freegen" onclick="setWallpaper('freegen')" data-i18n="wp_freegen">AI (FreeGen)</button>
                 </div>
               </div>
               <div class="mb-2" id="freegenPromptContainer" style="display:none">
-                <label class="form-label" style="font-size:0.65rem;color:rgba(255,255,255,0.5);margin-bottom:2px" data-i18n="freegen_prompt">FreeGen Prompt</label>
+                <label class="form-label" style="font-size:0.65rem;color:rgba(255,255,255,0.5);margin-bottom:2px" data-i18n="freegen_prompt">AI (FreeGen) Prompt</label>
                 <div class="input-group input-group-sm" style="gap:4px;margin-bottom:4px">
-                  <input type="text" class="form-control form-control-sm" id="freegenPromptInput" placeholder="Describe your wallpaper..." data-i18n-placeholder="freegen_placeholder" style="font-size:0.7rem;background:rgba(255,255,255,0.12);border-color:rgba(255,255,255,0.2);color:white">
-                  <button class="btn btn-outline-action" style="font-size:0.6rem;padding:0.2rem 0.5rem;white-space:nowrap" onclick="useDefaultFreegenPrompt()" title="Load default prompt" data-i18n="freegen_default">Default</button>
-                  <button class="btn btn-success" style="font-size:0.65rem;padding:0.2rem 0.5rem;white-space:nowrap" id="freegenGenerateBtn" onclick="generateFreegenWallpaper()" data-i18n="freegen_generate">Generate</button>
-                </div>
-                <div id="freegenStatus" style="font-size:0.65rem;color:rgba(255,255,255,0.55);min-height:1rem"></div>
+                   <input type="text" class="form-control form-control-sm" id="freegenPromptInput" placeholder="Describe your wallpaper..." data-i18n-placeholder="freegen_placeholder" style="font-size:0.7rem;background:rgba(255,255,255,0.12);border-color:rgba(255,255,255,0.2);color:white">
+                   <button class="btn btn-outline-action" style="font-size:0.6rem;padding:0.2rem 0.5rem;white-space:nowrap" onclick="useDefaultFreegenPrompt()" title="Load default prompt" data-i18n="freegen_default">Default</button>
+                    <button class="btn btn-success" style="font-size:0.65rem;padding:0.2rem 0.5rem;white-space:nowrap" id="freegenGenerateBtn" onclick="generateFreegenWallpaper()" data-i18n="freegen_generate">Generate</button>
+                 </div>
+                 <div id="freegenStatus" style="font-size:0.65rem;color:rgba(255,255,255,0.55);min-height:1rem"></div>
               </div>
             </div>
           </div>
@@ -677,29 +677,20 @@
     function renderModels() {
       const container = document.getElementById('modelsContainer');
       const badge = document.getElementById('modelCountBadge');
-      const enabled = new Set(enabledModels);
-      if (!allModels.length) {
+      if (!enabledModels.length) {
         badge.textContent = '0';
-        container.innerHTML = '<div class="text-center py-3"><i class="bi bi-info-circle" style="font-size:24px;color:rgba(255,255,255,0.4)"></i><p class="mt-2 text-muted">' + escapeHtml(t('models_loading','Loading models...')) + '</p></div>'; return;
+        container.innerHTML = '<div class="text-center py-3"><i class="bi bi-info-circle" style="font-size:24px;color:rgba(255,255,255,0.4)"></i><p class="mt-2 text-muted">' + escapeHtml(t('models_none','No enabled models. Add model IDs to ENABLED_MODELS in .config/config.json.')) + '</p></div>';
+        setTestChatVisible(false);
+        updateTestChatModels();
+        return;
       }
-      badge.textContent = enabledModels.length + '/' + allModels.length;
-      container.innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:1px">${allModels.map((model, idx) => {
-        const isEn = enabled.has(model);
+      badge.textContent = enabledModels.length;
+      container.innerHTML = `<div style="display:flex;flex-wrap:wrap;gap:1px">${enabledModels.map((model, idx) => {
         const display = allDisplayNames[model] || model.replace(/^umans-/i, '');
-        return `<div class="model-tag${isEn?' enabled':''}" onclick="toggleModel('${escapeHtml(model)}')" id="model-${idx}" title="${escapeHtml(model)}"><input type="checkbox" ${isEn?'checked':''}><div class="model-tag-row"><span class="model-tag-id">${escapeHtml(display)}</span></div></div>`;
+        return `<div class="model-tag enabled" title="${escapeHtml(model)}"><input type="checkbox" checked><div class="model-tag-row"><span class="model-tag-id">${escapeHtml(display)}</span></div></div>`;
       }).join('')}</div>`;
-      setTestChatVisible(allModels.length > 0);
+      setTestChatVisible(true);
       updateTestChatModels();
-    }
-
-    async function toggleModel(model) {
-      if (!model) return;
-      const isEn = enabledModels.includes(model);
-      if (isEn) {
-        try { const r=await fetch('/api/models/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({models:[model]})}); const d=await r.json(); if(d.success){enabledModels = enabledModels.filter(m=>m!==model); renderModels(); showToast(`${model} ${t('model_disabled','disabled')}`);} else showToast(t('toast_failed_prefix','Failed:') + ' ' + d.error,'danger'); } catch { showToast(t('toast_failed_prefix','Failed:'),'danger'); }
-      } else {
-        try { const r=await fetch('/api/models/add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({models:[model]})}); const d=await r.json(); if(d.success){enabledModels.push(model); renderModels(); showToast(`${model} ${t('model_enabled','enabled')}`);} else showToast(t('toast_failed_prefix','Failed:') + ' ' + d.error,'danger'); } catch { showToast(t('toast_failed_prefix','Failed:'),'danger'); }
-      }
     }
 
     async function fetchUmansUserStatus() {
@@ -771,15 +762,13 @@
 
     async function loadConfig() {
       try {
-        const [hr,cr,mr,sr]=await Promise.all([
-          fetch('/healthz'), fetch('/api/config'), fetch('/api/models'),
-          fetch('/api/models/search?per_page=200')
+        const [hr,cr,mr]=await Promise.all([
+          fetch('/healthz'), fetch('/api/config'), fetch('/api/models')
         ]);
-        proxyData=await hr.json(); const cd=await cr.json(); const md=await mr.json(); const sd=await sr.json();
+        proxyData=await hr.json(); const cd=await cr.json(); const md=await mr.json();
         enabledModels = md.models||[];
-        allModels = (sd.data||[]).map(m=>m.id);
+        allModels = enabledModels; // aliases for backward compatibility
         allDisplayNames = md.model_display_names||{};
-        for (const m of (sd.data||[])) { if (m.id && m.display_name) allDisplayNames[m.id] = m.display_name; }
         if(cd) {
           config=cd;
           if (cd.freegenPrompt) document.getElementById('freegenPromptInput').value = cd.freegenPrompt;
@@ -1016,10 +1005,9 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
       const sel = document.getElementById('testChatModelSelect');
       const current = sel.value;
       sel.innerHTML = '';
-      const all = allModels || [];
-      const enabled = new Set(enabledModels || []);
+      const all = enabledModels || [];
       if (!all.length) {
-        sel.innerHTML = '<option value="">' + escapeHtml(t('models_loading','Loading models...')) + '</option>';
+        sel.innerHTML = '<option value="">' + escapeHtml(t('models_none','No enabled models')) + '</option>';
         return;
       }
       all.forEach(m => {
@@ -1027,9 +1015,7 @@ container.innerHTML = `<div style="width:100%;font-size:11px;white-space:nowrap"
         opt.value = m;
         const dn = getModelDisplayName(m);
         const shortId = stripUmans(m.split('/').pop());
-        const suffix = enabled.has(m) ? '' : ' [disabled]';
-        opt.textContent = dn + ' (' + shortId + ')' + suffix;
-        opt.style.color = enabled.has(m) ? 'white' : 'rgba(255,255,255,0.4)';
+        opt.textContent = dn + ' (' + shortId + ')';
         sel.appendChild(opt);
       });
       if (current && all.includes(current)) sel.value = current;

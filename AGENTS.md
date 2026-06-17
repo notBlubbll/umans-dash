@@ -5,7 +5,7 @@
 ```
 UMANS-PROXY/
 ├── proxy.js              # Main proxy implementation + request router (~1610 lines)
-├── dashboard.html        # Dashboard with usage cards, model search, key management, test chat
+├── dashboard.html        # Dashboard with usage cards, enabled models list, key management, test chat
 ├── .config/
 │   ├── config.json       # Runtime configuration (API key, EMAIL/PASSWORD, enabled models, etc.)
 │   └── usage.json        # (reserved)
@@ -56,7 +56,18 @@ UMANS-PROXY/
 | `MAX_RETRIES` | Number | Upstream chat-completion retries (10) |
 | `RETRY_DELAY_MS` | Number | Base retry backoff (3000 ms) |
 
-### 3. Retry Logic (proxy.js:79-88, 1822-1916)
+### 3. Shell-Tool Guard (proxy.js:120-230)
+
+`isGitCommand(cmd)` detects shell commands that start with or invoke `git` (`git clean -fd`, `bash -c "git status"`, `cmd /c git ...`, quoted Windows paths to `git.exe`, etc.) while ignoring false positives such as `echo git` or `python script.py git`.
+
+`sanitizeShellToolCall(tc)` and `sanitizeChatCompletionResponse(body)` modify returned assistant `tool_calls` whose tool name matches `bash | shell | run_command_in_terminal | execute_command | run_in_terminal | send_to_terminal | run_vscode_command | create_and_run_task | terminal`. When a matched command is detected, the tool argument is rewritten to `echo "BLOCKED: git commands are disabled by proxy policy"` before the response reaches the client.
+
+Applies to:
+- Non-streaming chat responses
+- Streaming SSE responses (buffered and re-emitted)
+- Cached responses on cache hit
+
+### 4. Retry Logic (proxy.js:79-88, 1822-1916)
 
 `retryLoop(fn)` retries the upstream `/v1/chat/completions` request up to `MAX_RETRIES` times with escalating delays (`3s, 6s, 9s…`).
 
@@ -76,8 +87,9 @@ LRU cache for non-streaming LLM responses using Map insertion order.
 - **Stats**: `hits`, `misses`, `evictions`
 - `cacheKey(payload, model)` — builds MD5 hash
 - `GET/DELETE /api/cache` — stats/clear
+- Cached responses are passed through the shell-tool guard before being returned to the client.
 
-### 5. Key Pool (proxy.js:321-396)
+### 6. Key Pool (proxy.js:321-396)
 
 Round-robin multi-key pool with cooldown/unhealthy marking.
 - `acquire()` — Round-robins, returns `{ key, name, index }`, sets `config.apiKey` + `upstream.apiKey`
@@ -85,41 +97,40 @@ Round-robin multi-key pool with cooldown/unhealthy marking.
 - `markHealthy(index)` — Resets state
 - `get state()` — Returns array with masked tokens (first 10 + `...` + last 4)
 
-### 6. Upstream Client & Model Catalog (proxy.js:421-541)
+### 7. Upstream Client & Model Catalog (proxy.js:421-541)
 
 - `UpstreamClient` class with `getUserInfo()` (GET `/v1/models/info`, 10s timeout) and `chatCompletions(body)` (POST `/v1/chat/completions`)
 - `UPSTREAM_AGENT` — Keep-alive HTTPS agent (128 sockets, 60s keepalive)
 - `fetchModelCatalog()` — GET `/v1/models/info` with 15s timeout
-- `getCatalogData()` — Cached 5-min catalog fetcher, populates `modelDisplayNameMap`
-- `searchModels(query, filters)` — Local filter of catalog data (substring + family)
+- `getCatalogData()` — Cached 5-min catalog fetcher, populates `modelDisplayNameMap` and `modelInfoMap`
 
-### 7. Tool Schema Normalization (proxy.js:543-652)
+### 8. Tool Schema Normalization (proxy.js:543-652)
 
 Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullable patterns.
 - Key functions: `normalizeToolSchemas`, `normalizeSchemaMap`, `tryResolveRef`, `simplifyNullableCombinator`, `normalizeTypeField`, `normalizeEnumField`
 
-### 8. Stream/Body Utilities (proxy.js:654-728)
+### 9. Stream/Body Utilities (proxy.js:654-728)
 
 - `isNodeStream(body)` — Duck-type check for Node.js streams
 - `readBodyText(body)` — Handles Node streams, Web ReadableStreams, and async iterables
 - `pipeBodyToResponse(res, body)` — Pipes upstream response to HTTP response with abort handling
 
-### 9. HTTP Handler Helpers (proxy.js:730-759)
+### 10. HTTP Handler Helpers (proxy.js:730-759)
 
 - `authorized(req)` — Checks `x-api-key` or `Authorization: Bearer` against `config.apiKeys`
 - `readBody(req)` — Promisified chunk collector with `MAX_BODY_SIZE` cap
 - `writeJSON(res, status, payload)` / `writeOpenAIError(res, status, message, type, code)`
 
-### 10. Core HTTP Handlers (proxy.js:761-942)
+### 11. Core HTTP Handlers (proxy.js:761-942)
 
 - `handleHealthz` — Returns uptime, token_state, models_count, runtime, cache stats
 - `handleModels` — OpenAI-format model list from `config.enabledModels`
 - `processQueue()` — Dequeues from `requestQueue` while `activeRequests < limit`
 - `handleChatCompletions` — Parses body, queues or executes via `proxyChatRequest`
-- `proxyChatRequest` — Full proxy pipeline: key acquire → session label → reasoning strip → image-attachment limit (`limitImagesInMessages`) → cache check → model resolve → tool normalize → rate limit → **retry-wrapped upstream call** (see Retry Logic) → title-output sanitize (for title prompts) → stream/non-stream response. The full request body of the first request in a new session is logged to the console.
+- `proxyChatRequest` — Full proxy pipeline: key acquire → session label → reasoning strip → image-attachment limit (`limitImagesInMessages`) → cache check → model resolve → tool normalize → rate limit → **retry-wrapped upstream call** (see Retry Logic) → shell-tool guard → title-output sanitize (for title prompts) → stream/non-stream response. The full request body of the first request in a new session is logged to the console.
 - `validateApiKey()` — Calls `getUserInfo()`, populates `userInfoCache` + `modelDisplayNameMap`, returns boolean
 
-### 11. Request Router (proxy.js:963-1341)
+### 12. Request Router (proxy.js:963-1341)
 
 | Route | Methods | Description |
 |---|---|---|
@@ -127,10 +138,6 @@ Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullab
 | `/api/config` | GET/POST | Config read/write (masks API key) |
 | `/api/validate` | GET | Validate API key → `{ valid, hasApiKey }` |
 | `/api/models` | GET | Returns `{ models, model_display_names }` |
-| `/api/models/search` | GET | Search UMANS catalog with `q`, `family`, `license`, `modalities`, `capabilities`, `context_length_min/max`, `per_page` |
-| `/api/models/families` | GET | Returns sorted family list from catalog |
-| `/api/models/add` | POST | Add model IDs to enabled list |
-| `/api/models/remove` | POST | Remove model IDs from enabled list |
 | `/api/bg` | GET | Bing wallpaper proxy (peapix.com) |
 | `/api/bg-wallhaven` | GET | Wallhaven wallpaper proxy |
 | `/api/bg-freegen` | GET/POST | FreeGen AI wallpaper generator. `GET` returns the current cached wallpaper; `POST` waits for/waits for generation and returns the new image (`prompt`, `ratio`, `wait=true` JSON body). Background generation writes to `.cache/wallpaper-freegen.pending.jpg` and atomically swaps to `.cache/wallpaper-freegen.jpg` when done. |
@@ -147,12 +154,12 @@ Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullab
 | `/v1/models` | GET | OpenAI-format models |
 | `/v1/chat/completions` | POST | OpenAI chat (concurrency-queued) |
 
-### 12. Opencode Config Discovery & Setup (proxy.js:1343-1412)
+### 13. Opencode Config Discovery & Setup (proxy.js:1343-1412)
 
 - `discoverOpencodeConfigs()` — Native filesystem discovery on Windows: scans `C:\Users` for directories and checks each for `.opencode/opencode.json` and `.config/opencode/opencode.json`, plus the `systemprofile` variant. Falls back to `~/.config/opencode/` and `~/.opencode/`. Non-Windows: returns existing parent dirs of the two fallback paths.
 - `setupOpencodeConfig()` — Writes ALL models from `modelDisplayNameMap` to every discovered `opencode.json`. Falls back to `config.enabledModels` if map is empty. Creates `openconfig.b4umans.json` backup before first edit. Provider key: `umans`, uses `@ai-sdk/openai-compatible`. Each model gets `id`, `name`, `reasoning: true`, `interleaved: true`.
 
-### 13. Usage Tracking & App Auth (proxy.js:201-319)
+### 14. Usage Tracking & App Auth (proxy.js:201-319)
 
 - `fetchUsage()` — GET `https://app.umans.ai/api/usage?context=personal` (app session cookie, 10s timeout, 5min cache)
 - `fetchUsageHistory()` — GET `https://app.umans.ai/api/usage/history?from=...&to=...&granularity=day` (15s timeout, 5min cache)
@@ -165,7 +172,7 @@ Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullab
 - **Stat Cards** — Requests, Tokens, Cached % (grouped under a “Window” glass card)
 - **Usage History** — 90-day paginated table (10 per page)
 - **API Key section** — Key pool display with SS mode (blur on hover)
-- **Models section** — Search catalog with family filter, rich toggle tags grouped by family
+- **Models section** — View-only list of models in `ENABLED_MODELS`
 - **Quick Actions** — Check Health, Test Connection, Refresh Usage, Restart Proxy
 - **Test Chat** — Streaming/context chat panel with model selector
 - **Environment** — Runtime, Port, Started At, Wallpaper selector (None/Bing/Wallhaven/FreeGen), SS Mode toggle
@@ -299,7 +306,7 @@ curl http://localhost:8084/healthz
 curl http://localhost:8084/v1/models
 curl http://localhost:8084/api/umans/usage
 curl http://localhost:8084/api/umans/concurrency
-curl "http://localhost:8084/api/models/search?q=llama"
+curl http://localhost:8084/api/umans/concurrency
 curl "http://localhost:8084/api/i18n?locale=de&generate=1"
 ```
 

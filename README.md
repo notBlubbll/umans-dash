@@ -9,7 +9,6 @@ OpenAI-compatible proxy for [UMANS AI](https://code.umans.ai). Zero external dep
 - **OpenAI-Compatible API** — Drop-in for `/v1/chat/completions` and `/v1/models`
 - **Single Account** — One UMANS account with app login for usage tracking
 - **90-Day Usage History** — View daily token usage for the last 90 days
-- **Model Search & Add** — Search the UMANS model catalog from the dashboard and add models with one click
 - **Response Caching** — LRU cache for non-streaming responses
 - **Automatic Upstream Retry** — Retries failed `/v1/chat/completions` on HTTP 500/503 and network failures up to 10 times with escalating backoff, rotating the API key pool on each attempt
 - **Dashboard** — Clean UI with usage cards, model management, and configuration
@@ -59,7 +58,15 @@ Or on Windows, double-click `start.cmd`.
 
 ### 4. Add Models
 
-Open the dashboard at **http://localhost:8084** and use the model search to browse and add models.
+Edit `.config/config.json` and add the model IDs you want to expose to the `ENABLED_MODELS` array:
+
+```json
+{
+  "ENABLED_MODELS": ["qwen3-coder", "deepseek-v4-pro"]
+}
+```
+
+Restart the proxy for the change to take effect.
 
 ### 5. Use with Any OpenAI Client
 
@@ -87,14 +94,13 @@ Open **http://localhost:8084** in your browser.
 - **Account Status** — UMANS app login status
 
 ### Model Management
-- **Model Search** — Search the UMANS catalog by name or family
-- **Enable/Disable Models** — Toggle models on/off with one click
+- **Enabled Models** — View the models listed in `ENABLED_MODELS`
 
 ### Quick Actions
 - Health check, connection test, usage refresh, save configuration
 
 ### Autotranslate
-The dashboard can translate itself via the `umans-flash` model. Toggle the **autotranslate (beta)** switch in the bottom-left corner. If `LOCALE` is set in `.config/config.json`, that locale is forced and the dashboard loads translated automatically. The first load for a locale may take a few seconds while the proxy generates and caches the translation in `.cache/i18n/{locale}.json`. If no API key is configured, the dashboard stays in English.
+The dashboard can translate itself via the `umans-flash` model. Toggle the **AUTOTRANSLATION** switch in the bottom-left corner. If `LOCALE` is set in `.config/config.json`, that locale is forced and the dashboard loads translated automatically. The first load for a locale may take a few seconds while the proxy generates and caches the translation in `.cache/i18n/{locale}.json`. If no API key is configured, the dashboard stays in English.
 
 ## API Endpoints
 
@@ -107,9 +113,6 @@ The dashboard can translate itself via the `umans-flash` model. Toggle the **aut
 | `POST` | `/api/config` | Update proxy configuration |
 | `GET` | `/api/validate` | Validate API key |
 | `GET` | `/api/models` | List enabled models |
-| `GET` | `/api/models/search?q=...` | Search UMANS model catalog |
-| `POST` | `/api/models/add` | Add models to enabled list |
-| `POST` | `/api/models/remove` | Remove models from enabled list |
 | `GET` | `/api/umans/usage` | UMANS usage data |
 | `GET` | `/api/umans/usage-history` | 90-day usage history |
 | `GET` | `/api/umans/concurrency` | Concurrency sessions, limit, active count & queue depth |

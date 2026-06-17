@@ -116,6 +116,176 @@ function trackConversationSession(fingerprint, session) {
   conversationMap.set(fingerprint, session);
 }
 
+// ── Shell-command guard ─────────────────────────────────────────────────────
+// Blocks tool_calls that execute shell commands starting with "git" (case-
+// insensitive), e.g. "git clean -fd", "git reset", or wrappers like
+// "bash -c 'git status'". Works like GC3OC's tool-salvager, but installed
+// directly in the chat-completion proxy path.
+const SHELL_TOOL_NAMES = /^(bash|shell|run_command_in_terminal|execute_command|run_in_terminal|send_to_terminal|run_vscode_command|create_and_run_task|terminal)$/i;
+// Direct "git" executable, including quoted paths with spaces and "git.exe" on Windows.
+const GIT_EXECUTABLE_RE = /^(?:[\s]*["'])?(?:[a-zA-Z]:)?(?:[\\\/][^"']+)*[\\\/]?git(?:\.exe)?\b/i;
+// Simple shell wrappers: bash -c "...", cmd /c ..., powershell -Command "...", etc.
+const SHELL_WRAPPER_RE = /^(?:bash|sh|zsh|cmd|command|powershell|pwsh|fish|csh|ksh)(?:\.exe)?(?:\s+(?:\-[a-zA-Z]+|\/[a-zA-Z])+)*\s+(?:['"]|\-c\s+|\/c\s+)/i;
+// Common git subcommands; used to avoid false positives when "git" is just a word argument.
+const GIT_SUBCOMMAND_RE = /\b(git)\s+(?:add|commit|push|pull|clone|fetch|merge|rebase|reset|checkout|clean|rm|mv|status|log|diff|branch|tag|cherry|revert|stash|bisect|blame|init|remote|config|submodule|sparse|worktree|reflog|show|describe|rev|ls|cat)\b/i;
+
+function isGitCommand(cmd) {
+  if (typeof cmd !== 'string' || !cmd.trim()) return false;
+  const trimmed = cmd.trim();
+  if (GIT_EXECUTABLE_RE.test(trimmed)) return true;
+  if (SHELL_WRAPPER_RE.test(trimmed) && GIT_SUBCOMMAND_RE.test(trimmed)) return true;
+  return false;
+}
+
+function sanitizeShellToolCall(tc) {
+  if (!tc || !tc.function) return tc;
+  if (!SHELL_TOOL_NAMES.test(tc.function.name || '')) return tc;
+  let args;
+  try {
+    args = JSON.parse(tc.function.arguments || '{}');
+  } catch {
+    return tc;
+  }
+  const cmd = args.command;
+  if (!isGitCommand(cmd)) return tc;
+
+  const blockedMsg = 'echo "BLOCKED: git commands are disabled by proxy policy"';
+  console.log(`[ShellGuard] blocked ${tc.function.name}: ${cmd.substring(0, 200)}`);
+  return {
+    ...tc,
+    function: {
+      ...tc.function,
+      arguments: JSON.stringify({ ...args, command: blockedMsg }),
+    },
+  };
+}
+
+function sanitizeChatCompletionResponse(body) {
+  if (!body || typeof body !== 'object') return body;
+  if (!Array.isArray(body.choices)) return body;
+  for (const choice of body.choices) {
+    const msg = choice.message;
+    if (!msg || !Array.isArray(msg.tool_calls)) continue;
+    msg.tool_calls = msg.tool_calls.map(sanitizeShellToolCall);
+  }
+  return body;
+}
+
+// ── SSE stream sanitizer ──────────────────────────────────────────────────
+// Buffers an OpenAI-style streaming response, assembles partial tool_calls,
+// runs the shell guard, and re-emits sanitized SSE events. We accept the small
+// latency trade-off because agent tool-call streams are short, and rewriting
+// partial tool_call argument chunks mid-stream is fragile.
+function parseSseEvents(text) {
+  const events = [];
+  let currentEvent = null;
+  for (const line of text.split(/\r?\n/)) {
+    if (line === '') {
+      if (currentEvent) { events.push(currentEvent); currentEvent = null; }
+    } else if (line.startsWith('event:')) {
+      if (!currentEvent) currentEvent = { data: '' };
+      currentEvent.event = line.slice(6).trim();
+    } else if (line.startsWith('data:')) {
+      if (!currentEvent) currentEvent = { data: '' };
+      // Preserve newlines inside data by replacing literal "data:" lines
+      if (line === 'data:') {
+        currentEvent.data += '\n';
+      } else {
+        currentEvent.data += line.slice(5).trimStart() + '\n';
+      }
+    } else if (line.startsWith('id:')) {
+      if (!currentEvent) currentEvent = { data: '' };
+      currentEvent.id = line.slice(3).trim();
+    } else if (line.startsWith('retry:')) {
+      if (!currentEvent) currentEvent = { data: '' };
+      currentEvent.retry = line.slice(6).trim();
+    }
+  }
+  if (currentEvent) events.push(currentEvent);
+  for (const e of events) e.data = e.data.replace(/\n$/, '');
+  return events;
+}
+
+function serializeSseEvents(events) {
+  return events.map((e) => {
+    let out = [];
+    if (e.event) out.push(`event: ${e.event}`);
+    if (e.id) out.push(`id: ${e.id}`);
+    if (e.retry) out.push(`retry: ${e.retry}`);
+    if (e.data !== undefined && e.data !== null) {
+      for (const line of String(e.data).split(/\r?\n/)) {
+        out.push(`data: ${line}`);
+      }
+    }
+    out.push('');
+    return out.join('\n');
+  }).join('\n') + '\n';
+}
+
+function sanitizeSseResponse(text) {
+  const events = parseSseEvents(text);
+  const accum = {};
+  for (const e of events) {
+    if (e.event === 'ping' || !e.data) continue;
+    let obj;
+    try { obj = JSON.parse(e.data); } catch { continue; }
+    const delta = obj.choices?.[0]?.delta;
+    if (!delta?.tool_calls) continue;
+    for (const tc of delta.tool_calls) {
+      const idx = tc.index ?? 0;
+      if (!accum[idx]) accum[idx] = { index: idx, id: '', type: 'function', function: { name: '', arguments: '' } };
+      const a = accum[idx];
+      if (tc.id) a.id = tc.id;
+      if (tc.type) a.type = tc.type;
+      if (tc.function?.name) a.function.name += tc.function.name;
+      if (tc.function?.arguments != null) a.function.arguments += tc.function.arguments;
+    }
+  }
+  const indices = Object.keys(accum).map(Number).sort((a, b) => a - b);
+  const originalTools = indices.map(i => accum[i]);
+  const sanitizedTools = originalTools.map(sanitizeShellToolCall);
+  let anyBlocked = false;
+  for (let i = 0; i < sanitizedTools.length; i++) {
+    if (sanitizedTools[i] !== originalTools[i]) { anyBlocked = true; break; }
+  }
+  if (!anyBlocked) return text;
+
+  // Replace blocked tool call argument chunks with the final blocked command.
+  const firstEmitted = new Set();
+  const outEvents = [];
+  for (const e of events) {
+    if (e.event === 'ping' || !e.data) { outEvents.push(e); continue; }
+    let obj;
+    try { obj = JSON.parse(e.data); } catch { outEvents.push(e); continue; }
+    const delta = obj.choices?.[0]?.delta;
+    const toolCalls = delta?.tool_calls;
+    if (!Array.isArray(toolCalls)) { outEvents.push(e); continue; }
+    let modified = false;
+    for (const tc of toolCalls) {
+      const idx = tc.index ?? 0;
+      const sanitized = sanitizedTools[indices.indexOf(idx)];
+      if (!sanitized || sanitized === originalTools[indices.indexOf(idx)] || !tc.function) continue;
+      if (!firstEmitted.has(idx)) {
+        tc.function.name = sanitized.function.name;
+        tc.function.arguments = sanitized.function.arguments;
+        firstEmitted.add(idx);
+      } else {
+        // This and any further args chunks for this tool become no-ops.
+        tc.function.arguments = '';
+      }
+      modified = true;
+    }
+    if (modified) {
+      // Remove tool_call entries that have no payload (empty trailing chunks).
+      delta.tool_calls = toolCalls.filter(tc => tc.id || tc.function?.name || tc.function?.arguments);
+      outEvents.push({ ...e, data: JSON.stringify(obj) });
+    } else {
+      outEvents.push(e);
+    }
+  }
+  return serializeSseEvents(outEvents);
+}
+
 let activeRequests = 0;
 let requestQueue = [];
 
@@ -124,6 +294,27 @@ let modelCatalogCacheTime = 0;
 let modelDisplayNameMap = {};
 let modelInfoMap = {};
 const MODEL_CATALOG_CACHE_TTL = 5 * 60 * 1000;
+
+function getOrderedModelIds() {
+  const ids = Object.keys(modelInfoMap);
+  // Keep a stable, deterministic order: display_name then id
+  ids.sort((a, b) => {
+    const da = (modelDisplayNameMap[a] || a).toLowerCase();
+    const db = (modelDisplayNameMap[b] || b).toLowerCase();
+    if (da < db) return -1;
+    if (da > db) return 1;
+    return a.localeCompare(b);
+  });
+  return ids;
+}
+
+function getEffectiveModels() {
+  // Use all UMANS catalog models as the authoritative model list.
+  const catalogIds = getOrderedModelIds();
+  if (catalogIds.length > 0) return catalogIds;
+  // Fallback to legacy enabledModels only when catalog is empty.
+  return config?.enabledModels || [];
+}
 
 let modelsDevCache = null;
 let modelsDevCacheTime = 0;
@@ -372,9 +563,8 @@ const I18N_STRINGS = {
   tokens_none: 'No API keys',
 
   section_models: 'Models',
-  models_loading: 'Loading models...',
-  model_enabled: 'enabled',
-  model_disabled: 'disabled',
+    models_managed_hint: 'All UMANS models are loaded automatically from the API catalog.',
+    models_none: 'No UMANS models loaded. Check the API key on the Test Connection button.',
 
   section_quick_actions: 'Quick Actions',
   btn_check_health: 'Check Health',
@@ -405,8 +595,8 @@ const I18N_STRINGS = {
   wp_none: 'None',
   wp_bing: 'Bing',
   wp_wallhaven: 'Wallhaven',
-  wp_freegen: 'FreeGen',
-  freegen_prompt: 'FreeGen Prompt',
+  wp_freegen: 'AI (FreeGen)',
+  freegen_prompt: 'AI (FreeGen) Prompt',
   freegen_placeholder: 'Describe your wallpaper...',
   freegen_default: 'Default',
   freegen_generate: 'Generate',
@@ -451,7 +641,7 @@ const I18N_STRINGS = {
 
   overlay_translating: 'Translating',
   overlay_translating_sub: 'Translating UI to {lang}...',
-  autotranslate_label: 'autotranslate (beta)',
+  autotranslate_label: 'AUTOTRANSLATION',
   forced_locale_hint: '(forced: {locale})',
 
   toast_failed_prefix: 'Failed:',
@@ -1845,7 +2035,7 @@ async function handleHealthz(req, res) {
     token_state: poolState,
     valid_tokens: keyPool?.healthyCount || 0,
     total_tokens: keyPool?.total || 0,
-    models_count: (config.enabledModels || []).length,
+    models_count: getEffectiveModels().length,
     runtime: IS_BUN ? 'bun' : 'node',
     runtime_version: RUNTIME_VERSION,
     port: parseListenPort(config.listenAddr),
@@ -1855,7 +2045,8 @@ async function handleHealthz(req, res) {
 
 async function handleModels(req, res) {
   if (req.method !== 'GET') { writeOpenAIError(res, 405, 'method not allowed', 'invalid_request_error', ''); return; }
-  const models = config?.enabledModels || [];
+  await getCatalogData(); // ensure model catalog is loaded
+  const models = getEffectiveModels();
   const created = Math.floor(startTime.getTime() / 1000);
   writeJSON(res, 200, {
     object: 'list',
@@ -1958,8 +2149,11 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
       const promptPreview = extractUserPrompt(payload).substring(0, 80);
       console.log(`${reqStart} [${slot.name}]-[${requestedModel}]-cache:HIT ${promptPreview}`);
       try {
+        let parsed = null;
+        try { parsed = JSON.parse(cached); } catch (e) { /* ignore */ }
+        const finalBody = parsed ? JSON.stringify(sanitizeChatCompletionResponse(parsed)) : cached;
         res.writeHead(200, { 'Content-Type': 'application/json' });
-        res.end(cached);
+        res.end(finalBody);
       }
       catch (e) { /* ignore */ }
       return;
@@ -1971,9 +2165,9 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
 
   const resolvedModel = requestedModel.startsWith('umans-') ? requestedModel : (() => {
     const prefixed = 'umans-' + requestedModel;
-    const allEnabled = config.enabledModels || [];
-    if (allEnabled.includes(prefixed)) return prefixed;
-    const direct = allEnabled.find(m => m === requestedModel);
+    const allModels = getEffectiveModels();
+    if (allModels.includes(prefixed)) return prefixed;
+    const direct = allModels.find(m => m === requestedModel);
     return direct || requestedModel;
   })();
   payload.model = resolvedModel;
@@ -2011,32 +2205,31 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
     if (resp.status >= 200 && resp.status < 300) {
       try {
         if (contentType.includes('text/event-stream')) {
-          let headersSent = false;
-          const onData = (chunk) => {
-            if (!headersSent) {
-              res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-              headersSent = true;
-            }
-            res.write(Buffer.from(chunk));
-          };
-          const onEnd = () => { if (!headersSent) { res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' }); headersSent = true; } try { res.end(); } catch {} };
-          const onError = () => { if (!headersSent) { res.writeHead(502); } try { res.end(); } catch {} };
+          // Buffer the SSE stream so we can sanitize any shell tool_calls before
+          // the client sees them. Tool-call argument chunks may be split, so partial
+          // interception is unsafe; full-buffering is correct and acceptable for
+          // agent tool-call streams.
+          let rawSse = '';
+          const collectData = (chunk) => { rawSse += Buffer.from(chunk).toString('utf8'); };
           if (resp.body && typeof resp.body.pipe === 'function') {
             await new Promise((resolve) => {
-              resp.body.on('data', chunk => onData(chunk));
-              resp.body.on('end', () => { onEnd(); resolve(); });
-              resp.body.on('error', () => { onError(); resolve(); });
+              resp.body.on('data', collectData);
+              resp.body.on('end', resolve);
+              resp.body.on('error', resolve);
             });
           } else if (resp.body && typeof resp.body.getReader === 'function') {
             const reader = resp.body.getReader();
             try {
               while (true) {
                 const { done, value } = await reader.read();
-                if (done) { onEnd(); break; }
-                onData(value);
+                if (done) break;
+                collectData(value);
               }
-            } catch { onError(); }
+            } catch { /* fall through */ }
           }
+          const sanitizedSse = sanitizeSseResponse(rawSse);
+          res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+          try { res.end(sanitizedSse); } catch {}
         } else {
           let bodyText = await readBodyText(resp.body);
           const skipHeaders = new Set(['content-length', 'transfer-encoding', 'connection', 'keep-alive', 'content-encoding']);
@@ -2045,19 +2238,22 @@ async function proxyChatRequest(res, payload, requestedModel, writeError, writeU
             if (skipHeaders.has(key.toLowerCase())) continue;
             res.setHeader(key, values);
           }
+          let parsed = null;
+          try { parsed = JSON.parse(bodyText); } catch (e) { /* ignore */ }
+          if (parsed) parsed = sanitizeChatCompletionResponse(parsed);
           if (requestedStream) {
-            let parsed = null;
-            try { parsed = JSON.parse(bodyText); } catch (e) { /* ignore */ }
             res.writeHead(resp.status, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
-            res.end(parsed ? bodyText : `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: bodyText }, finish_reason: 'stop' }] })}
+            res.end(parsed ? JSON.stringify(parsed) : `data: ${JSON.stringify({ object: 'chat.completion.chunk', choices: [{ index: 0, delta: { content: bodyText }, finish_reason: 'stop' }] })}
 
 `);
           } else {
+            const finalBody = parsed ? JSON.stringify(parsed) : bodyText;
             res.writeHead(resp.status);
-            res.end(bodyText);
+            res.end(finalBody);
           }
-          if (ck) responseCache.set(ck, bodyText);
-          console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-body:${bodyText.substring(0, 800)}`);
+          const cacheBody = parsed ? JSON.stringify(parsed) : bodyText;
+          if (ck) responseCache.set(ck, cacheBody);
+          console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-body:${cacheBody.substring(0, 800)}`);
         }
       } catch (e) { console.error(`proxy response copy failed: ${e.message}`); }
       console.log(`${reqStart} [Session#${sessNum}>${slot.name}]-[${requestedModel}]-done:${Date.now() - reqStart}ms`);
@@ -2213,9 +2409,10 @@ async function handleRequest(req, res) {
         const newConfig = JSON.parse(body);
         if (newConfig.apiKey) config.apiKey = newConfig.apiKey;
         if (newConfig.apiKeys) config.apiKeys = newConfig.apiKeys;
-        if (newConfig.listenAddr) config.listenAddr = newConfig.listenAddr;
-        if (Array.isArray(newConfig.enabledModels)) config.enabledModels = newConfig.enabledModels;
-        if (newConfig.modelDisplayNames && typeof newConfig.modelDisplayNames === 'object') config.modelDisplayNames = newConfig.modelDisplayNames;
+  if (newConfig.listenAddr) config.listenAddr = newConfig.listenAddr;
+  // enabledModels is obsolete: the model list now comes from UMANS catalog.
+  if (Array.isArray(newConfig.enabledModels)) config.enabledModels = newConfig.enabledModels;
+  if (newConfig.modelDisplayNames && typeof newConfig.modelDisplayNames === 'object') config.modelDisplayNames = newConfig.modelDisplayNames;
         if (newConfig.email !== undefined) config.email = newConfig.email;
         if (newConfig.password !== undefined) config.password = newConfig.password;
         if (newConfig.wallpaperSource !== undefined) config.wallpaperSource = newConfig.wallpaperSource;
@@ -2242,7 +2439,8 @@ async function handleRequest(req, res) {
   }
 
   if (pathname === '/api/models' && req.method === 'GET') {
-    writeJSON(res, 200, { models: config.enabledModels || [], model_display_names: modelDisplayNameMap });
+    await getCatalogData();
+    writeJSON(res, 200, { models: getEffectiveModels(), model_display_names: modelDisplayNameMap });
     return;
   }
 
@@ -2618,10 +2816,7 @@ function setupOpencodeConfig() {
   const configPaths = discoverOpencodeConfigs();
   let firstRun = false;
 
-  const enabledModels = config.enabledModels || [];
-  const fallbackModels = enabledModels.length > 0
-    ? enabledModels
-    : (Object.keys(modelDisplayNameMap).length > 0 ? Object.keys(modelDisplayNameMap) : []);
+  const fallbackModels = getEffectiveModels();
 
   const modelsDevCatalog = modelsDevCache || {};
 
@@ -2642,6 +2837,13 @@ function setupOpencodeConfig() {
           reasoning: reasoningMode,
           interleaved: { field: 'reasoning_content' },
         };
+
+        if (m === 'umans-glm-5.2') {
+          entry.variants = {
+            high: { reasoningEffort: 'high' },
+            max: { reasoningEffort: 'max' },
+          };
+        }
 
         if (typeof caps.context_window === 'number' && caps.context_window > 0) {
           let outputLimit = caps.context_window;
