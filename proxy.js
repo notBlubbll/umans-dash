@@ -3311,10 +3311,10 @@ function setupOpencodeConfig() {
         models[m] = entry;
       }
       const providerEntry = {
-        npm: '@ai-sdk/anthropic',
+        npm: '@ai-sdk/openai-compatible',
         name: 'Umans.AI-Proxy',
         options: {
-          baseURL: `http://localhost:${port}`,
+          baseURL: `http://localhost:${port}/v1`,
           apiKey: config.apiKeys && config.apiKeys.length > 0 ? config.apiKeys[0] : 'umans-proxy',
         },
         models,

@@ -180,7 +180,7 @@ Normalizes JSON Schema in tools to handle `$ref`, `$defs`, `definitions`, nullab
 ### 13. Opencode Config Discovery & Setup (proxy.js:1343-1412)
 
 - `discoverOpencodeConfigs()` — Native filesystem discovery on Windows: scans `C:\Users` for directories and checks each for `.opencode/opencode.json` and `.config/opencode/opencode.json`, plus the `systemprofile` variant. Falls back to `~/.config/opencode/` and `~/.opencode/`. Non-Windows: returns existing parent dirs of the two fallback paths.
-- `setupOpencodeConfig()` — Writes ALL models from `modelDisplayNameMap` to every discovered `opencode.json`. Falls back to `config.enabledModels` if map is empty. Creates `openconfig.b4umans.json` backup before first edit. Provider key: `umans`, uses `@ai-sdk/anthropic`. Each model gets `id`, `name`, `reasoning: true`, `interleaved: true`.
+- `setupOpencodeConfig()` — Writes ALL models from `modelDisplayNameMap` to every discovered `opencode.json`. Falls back to `config.enabledModels` if map is empty. Creates `openconfig.b4umans.json` backup before first edit. Provider key: `umans`, uses `@ai-sdk/openai-compatible` (OpenAI-compatible, baseURL `/v1`). Each model gets `id`, `name`, `reasoning: true`, `interleaved: true`.
 
 ### 14. Usage Tracking & App Auth (proxy.js:201-319)
 
